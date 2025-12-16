@@ -12,7 +12,7 @@ Kurulumun tamamlanmasını bekleyin.
 Bağımlılıklar yüklendikten sonra aşağıdaki komutu çalıştırın:
 
 ```bash
-pip install -r requirements.txt
+python generate_data.py
 ```
 
 Bu dosya, patients.csv içerisinde bulunan sentetik veriler üzerine

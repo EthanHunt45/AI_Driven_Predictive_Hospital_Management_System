@@ -1,9 +1,0 @@
-nasıl çalıştırılır?
-
-pip install -r requirements.txt
-
-Gereksinimlerin yüklenmesini bekledikten sonra
-
-python train.py
-
-çıktılar ve kaydedilen model otomatik olarak gözükür.

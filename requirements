@@ -5,3 +5,7 @@ seaborn
 scikit-learn
 statsmodels
 joblib
+xgboost
+shap
+tensorflow
+streamlit

@@ -3,231 +3,245 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 import os
-
-# Machine Learning Libraries
+import joblib
+import warnings
 from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LinearRegression, LogisticRegression
-from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier, GradientBoostingClassifier
-from sklearn.metrics import (mean_absolute_error, mean_squared_error, r2_score,
-                             accuracy_score, f1_score,
-                             confusion_matrix)
+from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
+from sklearn.metrics import mean_absolute_error, r2_score, accuracy_score, f1_score
+from sklearn.preprocessing import MinMaxScaler
+import xgboost as xgb
+import shap
 from statsmodels.tsa.statespace.sarimax import SARIMAX
-import warnings
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
 
-# Gereksiz uyarıları kapatalım
+#Uyarıları görmemek için yaptım.
 warnings.filterwarnings('ignore')
 
-# Çıktı klasörü kontrolü
-if not os.path.exists('outputs'):
-    os.makedirs('outputs')
+# Klasör yapıları
+if not os.path.exists('outputs'): os.makedirs('outputs')
+if not os.path.exists('models'): os.makedirs('models')
 
-print("--- 1. DATA LOADING & PREPARATION ---")
-
-# Tüm veri setlerini yüklüyoruz
+print("--- 1. VERİ YÜKLEME VE HAZIRLIK ---")
 try:
-    patients_df = pd.read_csv('hospital_data/patients.csv')
+    patients_df = pd.read_csv('patients_augmented.csv')
     services_df = pd.read_csv('hospital_data/services_weekly.csv')
     staff_schedule_df = pd.read_csv('hospital_data/staff_schedule.csv')
-    print("All datasets (Patients, Services, Staff) loaded successfully.")
+    print("Veriler başarıyla yüklendi.")
 except FileNotFoundError:
-    print(
-        "ERROR: CSV files not found. Please ensure 'patients.csv', 'services_weekly.csv', and 'staff_schedule.csv' are in the same directory.")
+    print("HATA: 'patients_augmented.csv' bulunamadı. Önce generate_data.py çalıştırın.")
     exit()
 
-# Tarih ve LOS hesaplamaları
+# Tarih dönüşümleri
 patients_df['arrival_date'] = pd.to_datetime(patients_df['arrival_date'])
 patients_df['departure_date'] = pd.to_datetime(patients_df['departure_date'])
-patients_df['LOS'] = (patients_df['departure_date'] - patients_df['arrival_date']).dt.days
-patients_df['arrival_month'] = patients_df['arrival_date'].dt.month
+# stay_length zaten augmented veride var ama garanti olsun diye float yaptım
+patients_df['stay_length'] = patients_df['stay_length'].astype(float)
 
-# --- 2. EXPLORATORY DATA ANALYSIS (EDA) ---
-print("Generating EDA plots...")
+# --- 2. GELİŞMİŞ EDA (YENİ ÖZELLİKLER İÇİN) ---
+print("Gelişmiş EDA Grafikleri çiziliyor...")
 
-# Grafik 1: Yaş Dağılımı
-plt.figure(figsize=(10, 6))
-sns.histplot(patients_df['age'], bins=20, kde=True, color='skyblue')
-plt.title('Patient Age Distribution')
-plt.xlabel('Age')
-plt.ylabel('Frequency')
-plt.savefig('outputs/1_eda_age_distribution.png')
+# Grafik 1: Tanı (Diagnosis) bazlı Yatış Süresi (Boxplot) - Yeni özelliğin etkisi
+plt.figure(figsize=(12, 6))
+sns.boxplot(data=patients_df, x='service', y='stay_length', hue='diagnosis')
+plt.title('Length of Stay Distribution by Diagnosis & Service')
+plt.xticks(rotation=15)
+plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+plt.tight_layout()
+plt.savefig('outputs/1_eda_diagnosis_los.png')
 plt.close()
 
-# Grafik 2: Servis Dağılımı
+# Grafik 2: Şiddet Puanı (Severity) vs Risk Durumu - Yeni özelliğin etkisi
 plt.figure(figsize=(10, 6))
-sns.countplot(data=patients_df, x='service', palette='viridis')
-plt.title('Patient Count by Service')
-plt.xlabel('Service')
-plt.ylabel('Patient Count')
-plt.savefig('outputs/2_eda_service_distribution.png')
+sns.kdeplot(data=patients_df[patients_df['stay_length'] <= 7], x='severity_score', shade=True, label='Normal Stay',
+            color='green')
+sns.kdeplot(data=patients_df[patients_df['stay_length'] > 7], x='severity_score', shade=True,
+            label='Long Stay (High Risk)', color='red')
+plt.title('Impact of Severity Score on Length of Stay Risk')
+plt.legend()
+plt.savefig('outputs/2_eda_severity_risk.png')
 plt.close()
 
-# Grafik 3: Personel Dağılımı (YENİ)
-# Hangi serviste toplam kaç vardiya (shift) yapılmış?
-plt.figure(figsize=(10, 6))
-staff_counts = staff_schedule_df[staff_schedule_df['present'] == 1].groupby('service')['staff_id'].count().reset_index()
-sns.barplot(data=staff_counts, x='service', y='staff_id', palette='magma')
-plt.title('Total Staff Shifts by Service')
-plt.xlabel('Service')
-plt.ylabel('Total Shifts (Present)')
-plt.savefig('outputs/3_eda_staff_distribution.png')
-plt.close()
+# --- 3. TASK A: REGRESSION (LOS Prediction) ---
+print("\n--- Task A: Regression (Linear, RF, XGBoost) ---")
 
-# --- 3. TASK A: REGRESSION (Predicting Length of Stay) ---
-print("\n--- Task A: Regression Models (LOS Prediction) ---")
+# Feature Engineering
+categorical_cols = ['service', 'gender', 'diagnosis']
+df_encoded = pd.get_dummies(patients_df, columns=categorical_cols, drop_first=True)
 
-patients_encoded = pd.get_dummies(patients_df, columns=['service'], drop_first=True)
-features_reg = ['age', 'arrival_month'] + [col for col in patients_encoded.columns if 'service_' in col]
-X = patients_encoded[features_reg]
-y = patients_encoded['LOS']
+ignore_cols = ['patient_id', 'name', 'arrival_date', 'departure_date', 'stay_length', 'satisfaction']
+feature_cols = [c for c in df_encoded.columns if c not in ignore_cols]
 
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+X = df_encoded[feature_cols]
+y = df_encoded['stay_length']
+y_log = np.log1p(y)  # Log Transformation
 
+X_train, X_test, y_train_log, y_test_log = train_test_split(X, y_log, test_size=0.2, random_state=42)
+
+# Modeller: Linear, RF ve şimdi XGBoost
 reg_models = {
     "Linear Regression": LinearRegression(),
-    "Random Forest Regressor": RandomForestRegressor(n_estimators=100, random_state=42)
+    "Random Forest": RandomForestRegressor(n_estimators=100, random_state=42),
+    "XGBoost Regressor": xgb.XGBRegressor(objective='reg:squarederror', n_estimators=100, learning_rate=0.1,
+                                          random_state=42)
 }
 
-print(f"{'Model':<25} | {'MAE':<10} | {'RMSE':<10} | {'R2 Score':<10}")
-print("-" * 65)
+best_reg_model = None
+best_r2 = -float('inf')
+
+print(f"{'Model':<25} | {'MAE':<10} | {'R2 Score':<10}")
+print("-" * 50)
 
 for name, model in reg_models.items():
-    model.fit(X_train, y_train)
-    y_pred = model.predict(X_test)
+    model.fit(X_train, y_train_log)
+    preds_log = model.predict(X_test)
+    preds = np.expm1(preds_log)
+    y_test_actual = np.expm1(y_test_log)
 
-    mae = mean_absolute_error(y_test, y_pred)
-    rmse = np.sqrt(mean_squared_error(y_test, y_pred))
-    r2 = r2_score(y_test, y_pred)
+    mae = mean_absolute_error(y_test_actual, preds)
+    r2 = r2_score(y_test_actual, preds)
 
-    print(f"{name:<25} | {mae:<10.2f} | {rmse:<10.2f} | {r2:<10.4f}")
+    print(f"{name:<25} | {mae:<10.2f} | {r2:<10.4f}")
 
-    plt.figure(figsize=(8, 6))
-    plt.scatter(y_test, y_pred, alpha=0.6, color='blue')
-    plt.plot([y_test.min(), y_test.max()], [y_test.min(), y_test.max()], 'r--', lw=2)
-    plt.title(f'{name}: Actual vs Predicted LOS')
-    plt.xlabel('Actual LOS (Days)')
-    plt.ylabel('Predicted LOS (Days)')
-    plt.savefig(f'outputs/4_reg_scatter_{name.replace(" ", "_").lower()}.png')
-    plt.close()
+    if r2 > best_r2:
+        best_r2 = r2
+        best_reg_model = model
 
-# --- 4. TASK B: CLASSIFICATION (Predicting High Risk > 7 Days) ---
-print("\n--- Task B: Classification Models (High Risk Prediction) ---")
+# --- SHAP ANALİZİ (EXPLAINABILITY)  ---
+print("\n--- SHAP Explainability Analysis ---")
+# XGBoost veya RF için SHAP değerlerini hesapladım
+explainer = shap.TreeExplainer(best_reg_model)
+# Hesaplama hızı için test setinden 100 örnek alıyoruz
+shap_values = explainer.shap_values(X_test.iloc[:100])
 
-y_clf = (patients_encoded['LOS'] > 7).astype(int)
+plt.figure()
+shap.summary_plot(shap_values, X_test.iloc[:100], show=False)
+plt.title(f"SHAP Summary for {type(best_reg_model).__name__}")
+plt.savefig('outputs/3_shap_summary_regression.png', bbox_inches='tight')
+plt.close()
+print("SHAP grafiği kaydedildi (outputs/3_shap_summary_regression.png).")
+
+# --- 4. TASK B: CLASSIFICATION ---
+print("\n--- Task B: Classification (High Risk > 7 Days) ---")
+y_clf = (patients_df['stay_length'] > 7).astype(int)
 X_train_c, X_test_c, y_train_c, y_test_c = train_test_split(X, y_clf, test_size=0.2, random_state=42)
 
+# XGBoost Classifier ekliyoruz
 clf_models = {
     "Logistic Regression": LogisticRegression(max_iter=1000),
-    "Random Forest Classifier": RandomForestClassifier(n_estimators=100, random_state=42),
-    "Gradient Boosting": GradientBoostingClassifier(random_state=42)
+    "Random Forest": RandomForestClassifier(n_estimators=100, random_state=42),
+    "XGBoost Classifier": xgb.XGBClassifier(eval_metric='logloss', use_label_encoder=False, random_state=42)
 }
+
+best_clf_model = None
+best_f1 = 0
 
 print(f"{'Model':<25} | {'Accuracy':<10} | {'F1-Score':<10}")
 print("-" * 50)
 
 for name, model in clf_models.items():
     model.fit(X_train_c, y_train_c)
-    y_pred = model.predict(X_test_c)
-
-    acc = accuracy_score(y_test_c, y_pred)
-    f1 = f1_score(y_test_c, y_pred)
+    preds = model.predict(X_test_c)
+    acc = accuracy_score(y_test_c, preds)
+    f1 = f1_score(y_test_c, preds)
 
     print(f"{name:<25} | {acc:<10.2f} | {f1:<10.2f}")
 
-    cm = confusion_matrix(y_test_c, y_pred)
-    plt.figure(figsize=(6, 5))
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=['Normal', 'High Risk'],
-                yticklabels=['Normal', 'High Risk'])
-    plt.title(f'{name} Confusion Matrix')
-    plt.ylabel('True Label')
-    plt.xlabel('Predicted Label')
-    plt.savefig(f'outputs/5_clf_cm_{name.replace(" ", "_").lower()}.png')
-    plt.close()
+    if f1 > best_f1:
+        best_f1 = f1
+        best_clf_model = model
 
-# --- 5. TASK C: TIME SERIES (Demand Forecasting) ---
-print("\n--- Task C: Demand Forecasting (SARIMA) ---")
+# --- 5. TASK C: TIME SERIES (SARIMA vs LSTM)  ---
+print("\n--- Task C: Time Series Forecasting (SARIMA vs LSTM) ---")
 
 ts_data = services_df[services_df['service'] == 'emergency'].sort_values('week').reset_index(drop=True)
-train_size = int(len(ts_data) * 0.8)
-train_ts, test_ts = ts_data.iloc[:train_size], ts_data.iloc[train_size:]
+data_values = ts_data['patients_request'].values.astype(float)
 
+# Veriyi Hazırla
+train_size = int(len(data_values) * 0.8)
+train_data, test_data = data_values[:train_size], data_values[train_size:]
+
+# 1. SARIMA MODELİ
 try:
-    model_sarima = SARIMAX(train_ts['patients_request'], order=(1, 1, 1))
-    model_fit = model_sarima.fit(disp=False)
-    sarima_pred_full = model_fit.predict(start=0, end=len(ts_data) - 1)
+    sarima_model = SARIMAX(train_data, order=(1, 1, 1), seasonal_order=(1, 1, 1, 12))
+    sarima_fit = sarima_model.fit(disp=False)
+    sarima_pred = sarima_fit.predict(start=len(train_data), end=len(data_values) - 1)
+    sarima_mae = mean_absolute_error(test_data, sarima_pred)
+    print(f"SARIMA MAE: {sarima_mae:.2f}")
+except:
+    print("SARIMA hatası.")
+    sarima_pred = np.zeros(len(test_data))
 
-    test_pred_only = sarima_pred_full.iloc[len(train_ts):]
-    mae_ts = mean_absolute_error(test_ts['patients_request'], test_pred_only)
-    print(f"SARIMA Model MAE (Test Set Only): {mae_ts:.2f}")
+# 2. LSTM MODELİ (Derin Öğrenme)
+# LSTM veriyi 0-1 arasına sıkıştırmayı sever (Scaling)
+scaler = MinMaxScaler(feature_range=(0, 1))
+scaled_data = scaler.fit_transform(data_values.reshape(-1, 1))
 
-    plt.figure(figsize=(14, 7))
-    plt.plot(ts_data['week'], ts_data['patients_request'], label='Actual Data', color='green', linewidth=2, alpha=0.7)
-    plt.plot(ts_data['week'], sarima_pred_full, label='SARIMA Prediction', color='red', linestyle='--', linewidth=2)
-    plt.axvline(x=train_ts['week'].iloc[-1], color='black', linestyle=':', label='Train/Test Split')
-    plt.title('Emergency Service Weekly Demand Forecast (Full Dataset)')
-    plt.xlabel('Week')
-    plt.ylabel('Patient Count')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.savefig('outputs/6_ts_forecast_full_year.png')
-    plt.close()
-except Exception as e:
-    print(f"Error in Task C: {e}")
 
-# --- 6. TASK D: STAFF FORECASTING (YENİ BÖLÜM) ---
-print("\n--- Task D: Staff Schedule Forecasting (Random Forest) ---")
+# LSTM için veri hazırlama fonksiyonu (Sliding Window)
+def create_dataset(dataset, look_back=1):
+    X, Y = [], []
+    for i in range(len(dataset) - look_back - 1):
+        a = dataset[i:(i + look_back), 0]
+        X.append(a)
+        Y.append(dataset[i + look_back, 0])
+    return np.array(X), np.array(Y)
 
-# Veri Hazırlığı:
-# 1. Sadece 'Emergency' servisindeki 'Doctor'ları filtreliyoruz (Örnek senaryo)
-# 2. Haftalık toplam çalışan doktor sayısını buluyoruz.
-staff_ts = staff_schedule_df[
-    (staff_schedule_df['service'] == 'emergency') &
-    (staff_schedule_df['role'] == 'doctor')
-    ].groupby('week')['present'].sum().reset_index()
 
-# Basit bir regresyon için özellikler (Features) üretiyoruz
-# Model: Gelecek haftaki personel sayısını, sadece 'Hafta Numarası'na bakarak tahmin etmeye çalışacak.
-# (Daha karmaşık modellerde 'Lag' (geçmiş veriler) kullanılabilir)
-X_staff = staff_ts[['week']]
-y_staff = staff_ts['present']
+look_back = 3  # Geçmiş 3 haftaya bakarak gelecek haftayı tahmin et
+X_lstm, y_lstm = create_dataset(scaled_data, look_back)
 
-# Eğitim ve Test ayrımı
-X_train_s, X_test_s, y_train_s, y_test_s = train_test_split(X_staff, y_staff, test_size=0.2, shuffle=False)
+# Train/Test Split (LSTM için)
+train_size_lstm = int(len(X_lstm) * 0.8)
+X_train_lstm, X_test_lstm = X_lstm[:train_size_lstm], X_lstm[train_size_lstm:]
+y_train_lstm, y_test_lstm = y_lstm[:train_size_lstm], y_lstm[train_size_lstm:]
 
-# Random Forest Modeli
-rf_staff = RandomForestRegressor(n_estimators=100, random_state=42)
-rf_staff.fit(X_train_s, y_train_s)
+# LSTM [samples, time steps, features] formatı ister
+X_train_lstm = np.reshape(X_train_lstm, (X_train_lstm.shape[0], 1, X_train_lstm.shape[1]))
+X_test_lstm = np.reshape(X_test_lstm, (X_test_lstm.shape[0], 1, X_test_lstm.shape[1]))
 
-# Tahminler (Tüm veri seti üzerinde görselleştirme için)
-y_pred_staff_full = rf_staff.predict(X_staff)
+# Model Mimarisi
+model_lstm = Sequential()
+model_lstm.add(LSTM(50, input_shape=(1, look_back)))  # 50 Nöronlu LSTM katmanı
+model_lstm.add(Dropout(0.2))  # Overfitting engelleme
+model_lstm.add(Dense(1))  # Çıktı katmanı
+model_lstm.compile(loss='mean_squared_error', optimizer='adam')
 
-# Metrikler (Sadece Test seti üzerinde)
-y_pred_test_s = rf_staff.predict(X_test_s)
-mae_staff = mean_absolute_error(y_test_s, y_pred_test_s)
+# Modeli Eğit (Verbose=0 ile çıktı kirliliğini önle)
+model_lstm.fit(X_train_lstm, y_train_lstm, epochs=50, batch_size=1, verbose=0)
 
-print(f"Target: Weekly Doctor Count in Emergency")
-print(f"Model: Random Forest Regressor")
-print(f"MAE (Mean Absolute Error): {mae_staff:.2f} shifts")
-
-# Grafik Çizimi
-plt.figure(figsize=(14, 7))
-# Gerçek Veri
-plt.plot(staff_ts['week'], staff_ts['present'], label='Actual Staff Count', color='purple', linewidth=2, marker='o',
-         markersize=4)
 # Tahmin
-plt.plot(staff_ts['week'], y_pred_staff_full, label='Predicted Staff Count (RF)', color='orange', linestyle='--',
-         linewidth=2)
-# Ayrım Çizgisi
-plt.axvline(x=X_train_s['week'].iloc[-1], color='black', linestyle=':', label='Train/Test Split')
+lstm_pred_scaled = model_lstm.predict(X_test_lstm)
+lstm_pred = scaler.inverse_transform(lstm_pred_scaled)  # Skalayı geri çevir
+y_test_actual_lstm = scaler.inverse_transform([y_test_lstm])
 
-plt.title('Staff Capacity Forecast: Emergency Doctors (Weekly)')
-plt.xlabel('Week')
-plt.ylabel('Number of Doctors Present')
+lstm_mae = mean_absolute_error(y_test_actual_lstm[0], lstm_pred[:, 0])
+print(f"LSTM Model MAE: {lstm_mae:.2f}")
+
+# Karşılaştırma Grafiği
+plt.figure(figsize=(12, 6))
+plt.plot(np.arange(len(data_values)), data_values, label='Actual Data', color='gray', alpha=0.5)
+# Test seti indeksleri
+test_indices = np.arange(len(train_data), len(data_values))
+plt.plot(test_indices, sarima_pred, label=f'SARIMA (MAE: {sarima_mae:.1f})', color='red', linestyle='--')
+# LSTM indeksleri (Look back nedeniyle biraz daha kısa olabilir, uyduruyoruz)
+lstm_indices = np.arange(len(data_values) - len(lstm_pred), len(data_values))
+plt.plot(lstm_indices, lstm_pred, label=f'LSTM (MAE: {lstm_mae:.1f})', color='blue', linestyle='-.')
+
+plt.title('Time Series Benchmarking: SARIMA vs LSTM ')
 plt.legend()
-plt.grid(True, alpha=0.3)
-plt.savefig('outputs/7_staff_forecast.png')
+plt.savefig('outputs/6_timeseries_benchmark.png')
 plt.close()
 
-print("\n" + "=" * 40)
-print("ALL TASKS COMPLETED SUCCESSFULLY.")
-print("Check 'outputs/' folder for 7 generated graphs.")
-print("=" * 40)
+# --- 6. MODELLERİ KAYDETME ---
+print("\n--- Modeller Kaydediliyor ---")
+# En iyi Regresyon modelini kaydet
+joblib.dump(best_reg_model, 'models/los_regression_model.pkl')
+# En iyi Sınıflandırma modelini kaydet
+joblib.dump(best_clf_model, 'models/risk_classification_model.pkl')
+# Sütunları kaydet
+joblib.dump(feature_cols, 'models/feature_columns.pkl')
+
+print("BÜTÜN İŞLEMLER (XGBoost, LSTM, SHAP dahil) TAMAMLANDI.")
+print("Lütfen 'outputs/' klasöründeki yeni grafikleri inceleyin.")
